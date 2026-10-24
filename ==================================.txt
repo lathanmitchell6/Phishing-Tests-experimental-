@@ -1,0 +1,657 @@
+/**
+ * ============================================================================
+ * PhishSim.gs — Internal Phishing-Simulation Training Tool (Google Apps Script)
+ * ============================================================================
+ *
+ * AUTHORIZATION NOTICE
+ * ---------------------
+ * This tool is intended ONLY for authorized internal security-awareness
+ * testing run by/on behalf of an organization's IT Security team, with
+ * sign-off from leadership/HR/Legal as required by your organization's
+ * policy. Do not point this at addresses you do not have explicit
+ * authorization to test. Results should be used for coaching, not
+ * punitive action against individuals.
+ *
+ * This single file merges the original multi-file Python project into one
+ * Apps Script project:
+ *   config.py + db.py + sender.py + tracker.py + reply_checker.py +
+ *   weekly_report.py + scheduler.py  ->  this file
+ *
+ * ARCHITECTURE NOTES (Python -> Apps Script mapping)
+ * ----------------------------------------------------
+ *   SQLite (db.py)        -> a Google Sheet ("PhishSim DB") with 3 tabs:
+ *                            Campaigns / SentEmails / Events
+ *   smtplib (sender.py)   -> MailApp.sendEmail (or GmailApp for aliasing)
+ *   Flask (tracker.py)    -> doGet(e) on a deployed Web App, routed by a
+ *                            `?action=` query param since Apps Script Web
+ *                            Apps don't support path routing
+ *   IMAP (reply_checker)  -> GmailApp.search() against the mailbox the
+ *                            script is bound to (needs plus-addressing
+ *                            support from your mail provider, e.g. Gmail)
+ *   schedule lib          -> ScriptApp time-based triggers, installed by
+ *                            setupTriggers()
+ *
+ * SETUP
+ * -----
+ * 1. Create a new Apps Script project, paste this file in.
+ * 2. Fill in CONFIG below (or better, set values via
+ *    File > Project properties > Script properties, then read them in
+ *    getConfig() — placeholders are shown for both approaches).
+ * 3. Run initDb() once to create the tracking spreadsheet.
+ * 4. Deploy > New deployment > Web app (Execute as: Me, Access: Anyone)
+ *    to get the tracker URL, then paste that URL into
+ *    CONFIG.TRACKER_BASE_URL (or the WEB_APP_URL script property).
+ * 5. Run setupTriggers() once to schedule sendCampaign / checkReplies /
+ *    sendWeeklyReport, replacing scheduler.py's cron-style loop.
+ *
+ * IMPORTANT — REDEPLOY AFTER EDITS
+ * ---------------------------------
+ * Editing this file does NOT update your live /exec Web App URL. After any
+ * change (including the ones below), go to Deploy > Manage deployments,
+ * edit your existing deployment, and pick "New version" under Version, then
+ * Deploy. Creating a brand-new deployment instead will change the URL and
+ * break TRACKER_BASE_URL / links already sent out.
+ *
+ * ============================================================================
+ */
+
+// ---------------------------------------------------------------------------
+// CONFIG  (equivalent to config.py)
+// ---------------------------------------------------------------------------
+const CONFIG = {
+  // Address simulation emails are sent "from". With MailApp this must be an
+  // address/alias you're allowed to send as; with GmailApp it can be any
+  // verified alias on the account.
+  FROM_ADDRESS: 'IT Security Notice <resmanagers@onediversity.org>',
+
+  // Public URL of THIS script's Web App deployment (fill in after step 4
+  // above, or store it in Script Properties as WEB_APP_URL and read it in
+  // getConfig()).
+  TRACKER_BASE_URL: 'https://script.google.com/macros/s/REPLACE_WITH_DEPLOYMENT_ID/exec',
+
+  // Target user pool: only employees IN SCOPE for the exercise per your
+  // organization's authorization. Each entry needs a unique id.
+  TARGET_USERS: [
+    { id: 'u001', name: 'Lathan Mitchell', email: 'submit@onediversity.org' },
+    { id: 'u002', name: 'Jordan Lee', email: 'lmitchell@onediversity.org' },
+    { id: 'u003', name: 'Sam Patel', email: 'itadmin@onediversity.org' },
+    // add more authorized targets here
+  ],
+
+  // How many random users to include per campaign run.
+  USERS_PER_CAMPAIGN: 2,
+
+  // Recipients for the weekly results report.
+  REPORT_RECIPIENTS: ['itadmin@onediversity.org'],
+
+  // Name of the backing spreadsheet (created automatically if missing).
+  DB_SPREADSHEET_NAME: 'PhishSim DB',
+
+  EMAIL_SUBJECT: 'Action Required: Verify Your Account Access',
+  TEMPLATE_NAME: 'account_verification_v1',
+};
+
+/** Reads config, preferring Script Properties overrides where set. */
+function getConfig() {
+  const props = PropertiesService.getScriptProperties();
+  return {
+    ...CONFIG,
+    TRACKER_BASE_URL: props.getProperty('WEB_APP_URL') || CONFIG.TRACKER_BASE_URL,
+    FROM_ADDRESS: props.getProperty('FROM_ADDRESS') || CONFIG.FROM_ADDRESS,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// DB LAYER  (equivalent to db.py — Google Sheet instead of SQLite)
+// ---------------------------------------------------------------------------
+const SHEETS = {
+  CAMPAIGNS: 'Campaigns',
+  SENT_EMAILS: 'SentEmails',
+  EVENTS: 'Events',
+};
+
+const HEADERS = {
+  [SHEETS.CAMPAIGNS]: ['campaign_id', 'template_name', 'created_at'],
+  [SHEETS.SENT_EMAILS]: ['token', 'campaign_id', 'user_id', 'user_name', 'user_email', 'sent_at'],
+  [SHEETS.EVENTS]: ['event_id', 'token', 'event_type', 'occurred_at', 'ip_address', 'user_agent'],
+};
+
+/** Gets (or creates) the backing spreadsheet, with all sheets/headers set up. */
+function getDb() {
+  const cfg = getConfig();
+  const props = PropertiesService.getScriptProperties();
+  let ss;
+
+  const savedId = props.getProperty('DB_SPREADSHEET_ID');
+  if (savedId) {
+    try {
+      ss = SpreadsheetApp.openById(savedId);
+    } catch (e) {
+      ss = null;
+    }
+  }
+  if (!ss) {
+    ss = SpreadsheetApp.create(cfg.DB_SPREADSHEET_NAME);
+    props.setProperty('DB_SPREADSHEET_ID', ss.getId());
+  }
+
+  Object.keys(HEADERS).forEach((name) => {
+    let sheet = ss.getSheetByName(name);
+    if (!sheet) {
+      sheet = ss.insertSheet(name);
+      sheet.appendRow(HEADERS[name]);
+      sheet.setFrozenRows(1);
+    }
+  });
+
+  const defaultSheet = ss.getSheetByName('Sheet1');
+  if (defaultSheet && ss.getSheets().length > Object.keys(HEADERS).length) {
+    ss.deleteSheet(defaultSheet);
+  }
+
+  return ss;
+}
+
+/** One-time setup: creates the spreadsheet + sheets. Run manually first. */
+function initDb() {
+  const ss = getDb();
+  Logger.log('PhishSim DB ready at: ' + ss.getUrl());
+  return ss.getUrl();
+}
+
+function _sheet(name) {
+  return getDb().getSheetByName(name);
+}
+
+function _nowIso() {
+  return new Date().toISOString();
+}
+
+function createCampaign(templateName) {
+  const sheet = _sheet(SHEETS.CAMPAIGNS);
+  const campaignId = sheet.getLastRow();
+  sheet.appendRow([campaignId, templateName, _nowIso()]);
+  return campaignId;
+}
+
+function recordSentEmail(token, campaignId, user) {
+  const sheet = _sheet(SHEETS.SENT_EMAILS);
+  sheet.appendRow([token, campaignId, user.id, user.name, user.email, _nowIso()]);
+}
+
+function recordEvent(token, eventType, ipAddress, userAgent) {
+  const sheet = _sheet(SHEETS.EVENTS);
+  const eventId = sheet.getLastRow();
+  sheet.appendRow([eventId, token, eventType, _nowIso(), ipAddress || '', userAgent || '']);
+}
+
+/**
+ * Updates the ip_address / user_agent columns on the most recent Events row
+ * for a given token + event type. Used by recordClientMeta() to backfill
+ * data that only the browser can supply (see TRACKER section below), since
+ * recordEvent() is called server-side without that info.
+ */
+function _updateLatestEventMeta(token, eventType, ipAddress, userAgent) {
+  const sheet = _sheet(SHEETS.EVENTS);
+  const values = sheet.getDataRange().getValues();
+  // Walk backwards: the row we just wrote for this token/type is the most
+  // recent match, and rows are append-only so it's also the last one found.
+  for (let i = values.length - 1; i >= 1; i--) {
+    const row = values[i];
+    if (row[1] === token && row[2] === eventType) {
+      const rowNum = i + 1; // 1-indexed sheet row
+      if (ipAddress) sheet.getRange(rowNum, 5).setValue(ipAddress);
+      if (userAgent) sheet.getRange(rowNum, 6).setValue(userAgent);
+      return true;
+    }
+  }
+  return false;
+}
+
+function tokenExists(token) {
+  const sheet = _sheet(SHEETS.SENT_EMAILS);
+  const values = sheet.getDataRange().getValues();
+  for (let i = 1; i < values.length; i++) {
+    if (values[i][0] === token) return true;
+  }
+  return false;
+}
+
+function getSentEmailsSince(sinceDate) {
+  const sheet = _sheet(SHEETS.SENT_EMAILS);
+  const values = sheet.getDataRange().getValues();
+  const [headers, ...rows] = values;
+  return rows
+    .filter((r) => new Date(r[5]) >= sinceDate)
+    .map((r) => ({
+      token: r[0],
+      campaign_id: r[1],
+      user_id: r[2],
+      user_name: r[3],
+      user_email: r[4],
+      sent_at: r[5],
+    }));
+}
+
+function getEventsForToken(token) {
+  const sheet = _sheet(SHEETS.EVENTS);
+  const values = sheet.getDataRange().getValues();
+  const [headers, ...rows] = values;
+  return rows
+    .filter((r) => r[1] === token)
+    .map((r) => ({ event_type: r[2], occurred_at: r[3] }));
+}
+
+// ---------------------------------------------------------------------------
+// SENDER  (equivalent to sender.py)
+// ---------------------------------------------------------------------------
+const HTML_TEMPLATE = `
+<html>
+  <body style="font-family: Arial, sans-serif;">
+    <p>Hi {{name}},</p>
+    <p>Our records show your account access needs to be re-verified.
+       Please review the attached document and confirm your details
+       by clicking the link below within 24 hours.</p>
+    <p><a href="{{click_url}}">Verify My Account</a></p>
+    <p>Attachment: <a href="{{attachment_url}}">Account_Verification_Form.pdf</a></p>
+    <p>Thank you,<br/>IT Support</p>
+    <img src="{{pixel_url}}" width="1" height="1" style="display:none;" alt="" />
+  </body>
+</html>
+`;
+
+function _uuid() {
+  return Utilities.getUuid().replace(/-/g, '');
+}
+
+function buildTrackingUrls(token) {
+  const base = getConfig().TRACKER_BASE_URL.replace(/\/$/, '');
+  return {
+    pixel_url: `${base}?action=open&token=${token}`,
+    click_url: `${base}?action=click&token=${token}`,
+    attachment_url: `${base}?action=attachment&token=${token}`,
+  };
+}
+
+function _renderTemplate(tpl, vars) {
+  let out = tpl;
+  Object.keys(vars).forEach((k) => {
+    out = out.replace(new RegExp(`{{${k}}}`, 'g'), vars[k]);
+  });
+  return out;
+}
+
+/** Sample a random subset of `arr` of size n (Fisher-Yates partial shuffle). */
+function _sample(arr, n) {
+  const copy = arr.slice();
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy.slice(0, n);
+}
+
+/** Sends a simulation campaign to a random sample of TARGET_USERS. */
+function sendCampaign() {
+  const cfg = getConfig();
+  initDb();
+  const campaignId = createCampaign(cfg.TEMPLATE_NAME);
+
+  const sampleSize = Math.min(cfg.USERS_PER_CAMPAIGN, cfg.TARGET_USERS.length);
+  const targets = _sample(cfg.TARGET_USERS, sampleSize);
+
+  // Parse FROM_ADDRESS once, outside the loop — it's the same for every
+  // recipient and doesn't need re-validating per user.
+  const fromMatch = cfg.FROM_ADDRESS.match(/^(.*?)<(.+)@(.+)>$/);
+  if (!fromMatch) {
+    throw new Error(
+      `FROM_ADDRESS is not in "Name <user@domain>" format: "${cfg.FROM_ADDRESS}"`
+    );
+  }
+  const [, displayName, local, domain] = fromMatch;
+  const fromEmail = `${local}@${domain}`;
+
+  targets.forEach((user) => {
+    const token = _uuid();
+    const urls = buildTrackingUrls(token);
+    const htmlBody = _renderTemplate(HTML_TEMPLATE, { name: user.name, ...urls });
+
+    // GmailApp supports a Reply-To header; needed so checkReplies' plus-
+    // addressing scheme can correlate replies back to this token. Requires
+    // FROM_ADDRESS's domain to support plus-addressing (Gmail/Workspace).
+    const replyTo = `${local}+${token}@${domain}`;
+
+    // NOTE: GmailApp's `from` option must be a bare address that is a
+    // verified "send mail as" alias on this account (Gmail Settings ->
+    // Accounts -> Send mail as) — it rejects "Name <email>" strings, and
+    // errors even on a bare address if it isn't a verified alias.
+    GmailApp.sendEmail(user.email, cfg.EMAIL_SUBJECT, '', {
+      htmlBody,
+      from: fromEmail,
+      replyTo,
+      name: (displayName || 'IT Security Notice').trim(),
+    });
+
+    recordSentEmail(token, campaignId, user);
+    Logger.log(`Sent simulation email to ${user.email} (token=${token})`);
+  });
+
+  Logger.log(`Campaign ${campaignId} complete: ${targets.length} email(s) sent.`);
+}
+
+// ---------------------------------------------------------------------------
+// TRACKER  (equivalent to tracker.py — served via doGet Web App routing)
+// ---------------------------------------------------------------------------
+
+// 1x1 transparent PNG, base64-encoded, used as the open-tracking pixel.
+const TRANSPARENT_PIXEL_B64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+A8AAQUBAScy8ScAAAAASUVORK5CYII=';
+
+/**
+ * Education page HTML is now built per-request by _educationPageHtml(token)
+ * instead of being a static constant, so it can embed the token and call
+ * back into recordClientMeta() with the browser's own navigator.userAgent
+ * (and, optionally, its public IP via a client-side lookup). Apps Script's
+ * doGet(e) has no access to request headers server-side — e.parameter only
+ * exposes the query string — so User-Agent and IP can only be captured this
+ * way, from script running in the visitor's own browser.
+ */
+function _educationPageHtml(token, eventType) {
+  return `
+<html>
+  <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 60px auto;">
+    <h2>This was a phishing simulation</h2>
+    <p>This message was part of an authorized internal security-awareness
+       exercise. No real harm was done, but if this had been a genuine
+       phishing email, interacting with it could have exposed your
+       credentials or installed malware.</p>
+    <p>Tips for spotting phishing next time:</p>
+    <ul>
+      <li>Check the sender's actual email address, not just the display name.</li>
+      <li>Hover over links before clicking to preview the real destination.</li>
+      <li>Be wary of urgency ("act within 24 hours") and requests to verify credentials.</li>
+      <li>When in doubt, report the email to IT Security instead of clicking.</li>
+    </ul>
+    <p>Questions? Contact security-team@yourcompany.com.</p>
+    <script>
+      (function () {
+        var token = ${JSON.stringify(token)};
+        var eventType = ${JSON.stringify(eventType)};
+
+        function send(ip) {
+          google.script.run
+            .withFailureHandler(function (err) {
+              // Best-effort only — never block or alter the page for the
+              // visitor if this fails (e.g. offline, script blocked).
+              console.warn('recordClientMeta failed', err);
+            })
+            .recordClientMeta(token, eventType, navigator.userAgent, ip || '');
+        }
+
+        // Public IP lookup is optional and best-effort: if the visitor's
+        // network blocks third-party calls, or the request fails, we still
+        // record the user agent with an empty IP rather than nothing.
+        fetch('https://api.ipify.org?format=json')
+          .then(function (r) { return r.json(); })
+          .then(function (data) { send(data && data.ip); })
+          .catch(function () { send(''); });
+      })();
+    </script>
+  </body>
+</html>
+`;
+}
+
+// Tokens are always 32-char hex UUIDs (see _uuid()). Reject anything else
+// before it touches the sheet lookup or gets logged.
+const TOKEN_FORMAT_RE = /^[0-9a-f]{32}$/i;
+
+function _isValidToken(token) {
+  return typeof token === 'string' && TOKEN_FORMAT_RE.test(token);
+}
+
+/**
+ * Looks up + logs an event for a token, tolerating Sheets/API failures.
+ * Returns true if the token was valid and known, false otherwise — callers
+ * use this to decide what to show the visitor.
+ *
+ * NOTE: on a Sheets/API failure this previously returned `true` (masking
+ * the failure from the caller and, worse, from anyone debugging why events
+ * aren't showing up). It now returns false so callers/logs can tell "token
+ * unknown" apart from "write failed" — check the Apps Script execution log
+ * for the "recordEvent failed" line if events seem to be silently missing.
+ */
+function _tryRecordEvent(token, eventType) {
+  if (!_isValidToken(token)) return false;
+  try {
+    if (!tokenExists(token)) return false;
+    recordEvent(token, eventType, null, null);
+    return true;
+  } catch (err) {
+    Logger.log(`recordEvent failed for token=${token}, type=${eventType}: ${err}`);
+    return false;
+  }
+}
+
+/**
+ * Called from the browser (google.script.run) by the script embedded in
+ * _educationPageHtml() once the click/attachment education page has
+ * rendered. Backfills ip_address / user_agent on the Events row that
+ * _tryRecordEvent() already wrote for this token+eventType, since those
+ * fields aren't available to doGet() itself.
+ */
+function recordClientMeta(token, eventType, userAgent, ipAddress) {
+  if (!_isValidToken(token)) return;
+  try {
+    if (!tokenExists(token)) return;
+    _updateLatestEventMeta(token, eventType, ipAddress, userAgent);
+  } catch (err) {
+    Logger.log(`recordClientMeta failed for token=${token}, type=${eventType}: ${err}`);
+  }
+}
+
+function _pixelResponse() {
+  const bytes = Utilities.base64Decode(TRANSPARENT_PIXEL_B64);
+  return Utilities.newBlob(bytes, 'image/png', 'pixel.png')
+    .setContentType(ContentService.MimeType.PNG);
+}
+
+/**
+ * Single entry point for the deployed Web App. Routes on `?action=` since
+ * Apps Script Web Apps have no path routing, unlike Flask's @app.route.
+ *   ?action=open&token=...        -> tracking pixel (PNG)
+ *   ?action=click&token=...       -> education page (HTML)
+ *   ?action=attachment&token=...  -> logs then shows education page
+ *
+ * REMINDER: after editing this file, redeploy via Deploy > Manage
+ * deployments > (edit) > New version, or the live /exec URL keeps running
+ * old code. See the header comment for details.
+ */
+function doGet(e) {
+  try {
+    const action = e.parameter.action;
+    const token = e.parameter.token;
+
+    if (!token || !action) {
+      return HtmlService.createHtmlOutput('Missing action/token.');
+    }
+
+    if (action === 'open') {
+      _tryRecordEvent(token, 'open');
+      return _pixelResponse();
+    }
+
+    if (action === 'click') {
+      if (!_isValidToken(token)) {
+        return HtmlService.createHtmlOutput('Not found.');
+      }
+      _tryRecordEvent(token, 'click');
+      return HtmlService.createHtmlOutput(_educationPageHtml(token, 'click'));
+    }
+
+    if (action === 'attachment') {
+      if (!_isValidToken(token)) {
+        return HtmlService.createHtmlOutput('Not found.');
+      }
+      _tryRecordEvent(token, 'attachment_download');
+      return HtmlService.createHtmlOutput(_educationPageHtml(token, 'attachment_download'));
+    }
+
+    return HtmlService.createHtmlOutput('Unknown action.');
+  } catch (err) {
+    Logger.log(`doGet fatal error: ${err}`);
+    return HtmlService.createHtmlOutput(_educationPageHtml('', ''));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// REPLY CHECKER  (equivalent to reply_checker.py — Gmail search vs IMAP)
+// ---------------------------------------------------------------------------
+const TOKEN_RE = /phishsim\+([0-9a-f]{32})@/i;
+
+/** Scans unread mail for plus-addressed simulation replies, logs them. */
+function checkReplies() {
+  initDb();
+  const threads = GmailApp.search('to:phishsim+ is:unread', 0, 50);
+
+  threads.forEach((thread) => {
+    thread.getMessages().forEach((msg) => {
+      if (!msg.isUnread()) return;
+
+      const toAddr = (msg.getTo() || '') + ' ' + (msg.getCc() || '');
+      const match = TOKEN_RE.exec(toAddr);
+      if (match) {
+        const token = match[1];
+        if (_isValidToken(token) && tokenExists(token)) {
+          recordEvent(token, 'reply', null, null);
+          Logger.log(`Recorded reply for token=${token}`);
+        }
+      }
+      msg.markRead();
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// WEEKLY REPORT  (equivalent to weekly_report.py)
+// ---------------------------------------------------------------------------
+function gatherResults(days) {
+  days = days || 7;
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const sent = getSentEmailsSince(since);
+
+  return sent.map((s) => {
+    const events = getEventsForToken(s.token);
+    return {
+      user_name: s.user_name,
+      user_email: s.user_email,
+      sent_at: s.sent_at,
+      opened: events.some((e) => e.event_type === 'open'),
+      clicked: events.some((e) => e.event_type === 'click'),
+      downloaded_attachment: events.some((e) => e.event_type === 'attachment_download'),
+      replied: events.some((e) => e.event_type === 'reply'),
+    };
+  });
+}
+
+function buildReportHtml(rows) {
+  const total = rows.length;
+  const pct = (n) => (total ? ((n / total) * 100).toFixed(0) : '0');
+  const opened = rows.filter((r) => r.opened).length;
+  const clicked = rows.filter((r) => r.clicked).length;
+  const downloaded = rows.filter((r) => r.downloaded_attachment).length;
+  const replied = rows.filter((r) => r.replied).length;
+
+  const tableRows = rows
+    .map(
+      (r) => `
+        <tr>
+          <td>${r.user_name}</td>
+          <td>${r.user_email}</td>
+          <td>${r.sent_at}</td>
+          <td>${r.opened ? 'Yes' : 'No'}</td>
+          <td>${r.clicked ? 'Yes' : 'No'}</td>
+          <td>${r.downloaded_attachment ? 'Yes' : 'No'}</td>
+          <td>${r.replied ? 'Yes' : 'No'}</td>
+        </tr>`
+    )
+    .join('');
+
+  return `
+    <html><body style="font-family: Arial, sans-serif;">
+    <h2>Weekly Phishing Simulation Report</h2>
+    <p>Period: last 7 days &mdash; generated ${new Date().toISOString()}</p>
+    <p>
+      Emails sent: <b>${total}</b> &nbsp;|&nbsp;
+      Opened: <b>${opened}</b> (${pct(opened)}%) &nbsp;|&nbsp;
+      Clicked link: <b>${clicked}</b> (${pct(clicked)}%) &nbsp;|&nbsp;
+      Opened attachment: <b>${downloaded}</b> (${pct(downloaded)}%) &nbsp;|&nbsp;
+      Replied: <b>${replied}</b> (${pct(replied)}%)
+    </p>
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse;">
+      <tr style="background:#eee;">
+        <th>Name</th><th>Email</th><th>Sent At</th>
+        <th>Opened</th><th>Clicked</th><th>Downloaded Attachment</th><th>Replied</th>
+      </tr>
+      ${tableRows}
+    </table>
+    <p style="color:#666; font-size:12px;">
+      This report is for authorized internal security-awareness purposes only.
+      Data should be used for training/coaching, not punitive action, per your
+      organization's phishing-simulation policy.
+    </p>
+    </body></html>
+  `;
+}
+
+function sendWeeklyReport() {
+  const cfg = getConfig();
+  const rows = gatherResults(7);
+  const html = buildReportHtml(rows);
+
+  GmailApp.sendEmail(cfg.REPORT_RECIPIENTS.join(','), `Weekly Phishing Simulation Report - ${new Date().toISOString().slice(0, 10)}`, '', {
+    htmlBody: html,
+    from: cfg.FROM_ADDRESS,
+    name: 'IT Security Notice',
+  });
+
+  Logger.log(`Weekly report sent to ${cfg.REPORT_RECIPIENTS.join(', ')} (${rows.length} records).`);
+}
+
+// ---------------------------------------------------------------------------
+// SCHEDULER  (equivalent to scheduler.py — installable time-based triggers)
+// ---------------------------------------------------------------------------
+
+/**
+ * One-time setup: installs triggers equivalent to the recommended cron:
+ *   0 9 * * MON   -> sendCampaign
+ *   every 15 min  -> checkReplies
+ *   0 16 * * FRI  -> sendWeeklyReport
+ * Run this once manually (or re-run after deleting old triggers).
+ */
+function setupTriggers() {
+  deleteAllTriggers_();
+
+  ScriptApp.newTrigger('sendCampaign')
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.MONDAY)
+    .atHour(9)
+    .create();
+
+  ScriptApp.newTrigger('checkReplies')
+    .timeBased()
+    .everyMinutes(15)
+    .create();
+
+  ScriptApp.newTrigger('sendWeeklyReport')
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.FRIDAY)
+    .atHour(16)
+    .create();
+
+  Logger.log('Triggers installed: sendCampaign (Mon 9am), checkReplies (every 15min), sendWeeklyReport (Fri 4pm).');
+}
+
+function deleteAllTriggers_() {
+  ScriptApp.getProjectTriggers().forEach((t) => ScriptApp.deleteTrigger(t));
+}
