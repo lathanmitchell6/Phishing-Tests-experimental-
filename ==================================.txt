@@ -62,7 +62,7 @@ const CONFIG = {
   // Address simulation emails are sent "from". With MailApp this must be an
   // address/alias you're allowed to send as; with GmailApp it can be any
   // verified alias on the account.
-  FROM_ADDRESS: 'IT Security Notice <resmanagers@onediversity.org>',
+  FROM_ADDRESS: 'IT Security Notice <email>',
 
   // Public URL of THIS script's Web App deployment (fill in after step 4
   // above, or store it in Script Properties as WEB_APP_URL and read it in
@@ -72,9 +72,9 @@ const CONFIG = {
   // Target user pool: only employees IN SCOPE for the exercise per your
   // organization's authorization. Each entry needs a unique id.
   TARGET_USERS: [
-    { id: 'u001', name: 'Lathan Mitchell', email: 'submit@onediversity.org' },
-    { id: 'u002', name: 'Jordan Lee', email: 'lmitchell@onediversity.org' },
-    { id: 'u003', name: 'Sam Patel', email: 'itadmin@onediversity.org' },
+    { id: 'u001', name: 'name', email: 'email' },
+    { id: 'u002', name: 'name', email: 'email' },
+    { id: 'u003', name: 'name', email: 'email' },
     // add more authorized targets here
   ],
 
@@ -82,7 +82,7 @@ const CONFIG = {
   USERS_PER_CAMPAIGN: 2,
 
   // Recipients for the weekly results report.
-  REPORT_RECIPIENTS: ['itadmin@onediversity.org'],
+  REPORT_RECIPIENTS: ['email'],
 
   // Name of the backing spreadsheet (created automatically if missing).
   DB_SPREADSHEET_NAME: 'PhishSim DB',
